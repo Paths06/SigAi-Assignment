@@ -1,0 +1,125 @@
+groups:
+  - name: websocket_alerts
+    interval: 30s
+    rules:
+      # Alert if no active WebSocket connections for >60s
+      - alert: NoActiveWebSocketConnections
+        expr: websocket_connections_active == 0
+        for: 60s
+        labels:
+          severity: warning
+          service: django-websocket
+        annotations:
+          summary: "No active WebSocket connections"
+          description: "{{ $labels.instance }} has had 0 active WebSocket connections for more than 60 seconds"
+          
+      # Alert if error rate is too high
+      - alert: HighWebSocketErrorRate
+        expr: rate(websocket_errors_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+          service: django-websocket
+        annotations:
+          summary: "High WebSocket error rate"
+          description: "{{ $labels.instance }} has error rate of {{ $value }} errors/sec (threshold: 0.1)"
+          
+      # Alert if application is not ready
+      - alert: ApplicationNotReady
+        expr: app_ready == 0
+        for: 30s
+        labels:
+          severity: critical
+          service: django-websocket
+        annotations:
+          summary: "Application not ready"
+          description: "{{ $labels.instance }} has been in not-ready state for more than 30 seconds"
+          
+      # Alert if shutdown takes too long
+      - alert: SlowGracefulShutdown
+        expr: websocket_shutdown_duration_seconds > 10
+        labels:
+          severity: warning
+          service: django-websocket
+        annotations:
+          summary: "Slow graceful shutdown"
+          description: "Graceful shutdown took {{ $value }} seconds (threshold: 10s)"
+          
+      # Alert if too many connections
+      - alert: TooManyWebSocketConnections
+        expr: websocket_connections_active > 4500
+        for: 5m
+        labels:
+          severity: warning
+          service: django-websocket
+        annotations:
+          summary: "Approaching connection limit"
+          description: "{{ $labels.instance }} has {{ $value }} active connections (limit: 5000)"
+          
+      # Alert if memory usage is high
+      - alert: HighMemoryUsage
+        expr: memory_usage_bytes{type="rss"} > 1073741824  # 1GB
+        for: 10m
+        labels:
+          severity: warning
+          service: django-websocket
+        annotations:
+          summary: "High memory usage"
+          description: "{{ $labels.instance }} is using {{ humanize $value }} of memory"
+          
+      # Alert if database connections exhausted
+      - alert: DatabaseConnectionsExhausted
+        expr: db_connections_active > 90
+        for: 5m
+        labels:
+          severity: critical
+          service: django-websocket
+        annotations:
+          summary: "Database connection pool nearly exhausted"
+          description: "{{ $labels.instance }} has {{ $value }} active DB connections (limit: 100)"
+          
+      # Alert if response time is slow
+      - alert: SlowResponseTime
+        expr: histogram_quantile(0.95, django_request_duration_seconds_bucket) > 2
+        for: 10m
+        labels:
+          severity: warning
+          service: django-websocket
+        annotations:
+          summary: "Slow response times"
+          description: "95th percentile response time is {{ $value }}s (threshold: 2s)"
+
+  - name: infrastructure_alerts
+    interval: 60s
+    rules:
+      # Alert if Redis is down
+      - alert: RedisDown
+        expr: up{job="redis"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: redis
+        annotations:
+          summary: "Redis is down"
+          description: "Redis instance {{ $labels.instance }} is not responding"
+          
+      # Alert if PostgreSQL is down
+      - alert: PostgreSQLDown
+        expr: up{job="postgresql"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: postgresql
+        annotations:
+          summary: "PostgreSQL is down"
+          description: "PostgreSQL instance {{ $labels.instance }} is not responding"
+          
+      # Alert if disk space is low
+      - alert: LowDiskSpace
+        expr: node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"} < 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low disk space"
+          description: "{{ $labels.instance }} has only {{ $value | humanizePercentage }} disk space left"
