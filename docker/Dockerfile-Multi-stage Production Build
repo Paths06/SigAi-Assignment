@@ -1,0 +1,93 @@
+# Multi-stage Dockerfile for Django WebSocket Application
+# Optimized for production with minimal layers and security
+
+# Stage 1: Python dependencies
+FROM python:3.11-slim as python-deps
+
+# Install system dependencies for building Python packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Copy and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Stage 2: Node dependencies for frontend assets (if needed)
+FROM node:18-alpine as node-deps
+
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+
+# Stage 3: Production image
+FROM python:3.11-slim
+
+# Install runtime dependencies only
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    curl \
+    netcat-traditional \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN groupadd -r django && useradd -r -g django django
+
+# Copy Python virtual environment from builder
+COPY --from=python-deps /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Set up application directory
+WORKDIR /app
+
+# Copy application code
+COPY --chown=django:django app/ /app/
+COPY --chown=django:django scripts/ /scripts/
+
+# Create necessary directories
+RUN mkdir -p /app/staticfiles /app/media /tmp/prometheus && \
+    chown -R django:django /app /tmp/prometheus
+
+# Environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    DJANGO_SETTINGS_MODULE=config.settings \
+    PORT=8000 \
+    PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:${PORT}/healthz || exit 1
+
+# Switch to non-root user
+USER django
+
+# Collect static files
+RUN python manage.py collectstatic --noinput
+
+# Expose port
+EXPOSE ${PORT}
+
+# Startup script with signal handling
+COPY --chown=django:django docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+
+# Default command - can be overridden
+CMD ["uvicorn", "config.asgi:application", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--workers", "4", \
+     "--loop", "uvloop", \
+     "--lifespan", "on", \
+     "--access-log", \
+     "--log-config", "/app/logging.yaml"]
