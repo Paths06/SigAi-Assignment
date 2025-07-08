@@ -1,0 +1,206 @@
+version: '3.9'
+
+x-django-common: &django-common
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  environment:
+    - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY:-your-secret-key-here}
+    - DJANGO_DEBUG=${DJANGO_DEBUG:-False}
+    - DJANGO_ALLOWED_HOSTS=${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1}
+    - REDIS_URL=redis://redis:6379/0
+    - DATABASE_URL=postgresql://postgres:postgres@db:5432/django_ws
+    - PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus
+    # ASGI Worker Configuration
+    # - 4 workers for quad-core machines (1 per core)
+    # - 2 threads per worker for handling sync Django views
+    # - uvloop for better async performance
+    - UVICORN_WORKERS=${UVICORN_WORKERS:-4}
+    - UVICORN_THREADS=${UVICORN_THREADS:-2}
+    - WEB_CONCURRENCY=${WEB_CONCURRENCY:-4}
+  volumes:
+    - static_volume:/app/staticfiles
+    - media_volume:/app/media
+  depends_on:
+    - redis
+    - db
+  restart: unless-stopped
+  networks:
+    - django-network
+
+services:
+  # PostgreSQL Database
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=django_ws
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - django-network
+
+  # Redis for Django Channels
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - django-network
+
+  # Django Application (Blue)
+  app_blue:
+    <<: *django-common
+    container_name: django_ws_blue
+    environment:
+      - COLOR=blue
+      - PORT=8001
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.app_blue.rule=Host(`app.local`) && Headers(`X-Color`, `blue`)"
+      - "traefik.http.services.app_blue.loadbalancer.server.port=8001"
+      - "deployment.color=blue"
+    ports:
+      - "8001:8001"
+
+  # Django Application (Green)
+  app_green:
+    <<: *django-common
+    container_name: django_ws_green
+    environment:
+      - COLOR=green
+      - PORT=8002
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.app_green.rule=Host(`app.local`) && Headers(`X-Color`, `green`)"
+      - "traefik.http.services.app_green.loadbalancer.server.port=8002"
+      - "deployment.color=green"
+    ports:
+      - "8002:8002"
+    profiles:
+      - green
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - static_volume:/static:ro
+      - media_volume:/media:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - app_blue
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - django-network
+
+  # Traefik for Blue-Green Routing
+  traefik:
+    image: traefik:v3.0
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--metrics.prometheus=true"
+      - "--metrics.prometheus.buckets=0.1,0.3,1.2,5.0"
+    ports:
+      - "8080:8080"  # Traefik dashboard
+      - "8000:80"    # Main app access
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - django-network
+
+  # Prometheus for Metrics
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - django-network
+
+  # Grafana for Dashboards
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - django-network
+
+  # Loki for Log Aggregation (optional)
+  loki:
+    image: grafana/loki:latest
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki_data:/loki
+    networks:
+      - django-network
+    profiles:
+      - monitoring
+
+  # Promtail for Log Shipping (optional)
+  promtail:
+    image: grafana/promtail:latest
+    volumes:
+      - ./monitoring/promtail/config.yml:/etc/promtail/config.yml:ro
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - django-network
+    profiles:
+      - monitoring
+
+volumes:
+  postgres_data:
+  redis_data:
+  static_volume:
+  media_volume:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+
+networks:
+  django-network:
+    driver: bridge
